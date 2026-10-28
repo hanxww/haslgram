@@ -1,0 +1,110 @@
+            'platforms;android-36' \
+            'build-tools;36.0.0' \
+            'ndk;27.2.12479018' \
+            'cmake;3.22.1'
+          df -h .
+
+      - name: Install compatible Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Apply HaslGram test branding and arm64 restriction
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          props_path = Path('gradle.properties')
+          props = props_path.read_text(encoding='utf-8')
+          props, count = re.subn(
+              r'(?m)^APP_PACKAGE\s*=\s*[^\r\n]+$',
+              'APP_PACKAGE=com.haslgram.messenger', props
+          )
+          if count != 1:
+              raise SystemExit('Expected exactly one APP_PACKAGE in gradle.properties')
+          props_path.write_text(props, encoding='utf-8')
+
+          res = Path('TMessagesProj_AppStandalone/src/main/res')
+          main_values = res / 'values'
+          if not main_values.is_dir():
+              raise SystemExit('Missing Android standalone resources')
+          pattern = re.compile(r'(<string\s+name=["\']AppName["\']\s*>)([^<]*)(</string>)')
+          changed = 0
+          for path in sorted(res.glob('values*/*.xml')):
+              original = path.read_text(encoding='utf-8')
+              updated, n = pattern.subn(lambda m: m.group(1) + 'HaslGram' + m.group(3), original)
+              if n:
+                  ET.fromstring(updated)
+                  path.write_text(updated, encoding='utf-8')
+                  changed += n
+          if not changed:
+              dest = main_values / 'haslgram_name.xml'
+              if dest.exists():
+                  raise SystemExit('Unexpected existing haslgram_name.xml')
+              dest.write_text(
+                  '<?xml version="1.0" encoding="utf-8"?>\n'
+                  '<resources><string name="AppName">HaslGram</string></resources>\n',
+                  encoding='utf-8'
+              )
+          manifest = Path('TMessagesProj/config/release/AndroidManifest_standalone.xml')
+          if '@string/AppName' not in manifest.read_text(encoding='utf-8'):
+              raise SystemExit('Unexpected launcher label in manifest')
+
+          gradle_file = Path('TMessagesProj_AppStandalone/build.gradle')
+          source = gradle_file.read_text(encoding='utf-8')
+          source, count = re.subn(
+              r'(?m)^(\s*abiFilters\s+)"armeabi-v7a",\s*"arm64-v8a",\s*"x86",\s*"x86_64"',
+              r'\g<1>"arm64-v8a"', source
+          )
+          if count != 1:
+              raise SystemExit('Expected one afat ABI filter declaration; inspect upstream changes')
+          gradle_file.write_text(source, encoding='utf-8')
+          print('Prepared HaslGram package + launcher name; arm64-v8a only')
+          PY
+
+      - name: Build signed DEBUG APK with temporary CI-only key
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Upstream requires a release.keystore even for its debug variant.
+          # Never use the upstream signing password or a production key in CI.
+          KEYPASS="$(openssl rand -hex 20)"
+          echo "::add-mask::$KEYPASS"
+          mkdir -p TMessagesProj/config
+          keytool -genkeypair -noprompt \
+            -keystore TMessagesProj/config/release.keystore \
+            -alias haslgramci \
+            -storepass "$KEYPASS" \
+            -keypass "$KEYPASS" \
+            -keyalg RSA -keysize 3072 -validity 365 \
+            -dname 'CN=HaslGram Test Build, OU=CI, O=HaslGram, C=FR'
+          gradle --no-daemon --max-workers=2 --stacktrace \
+            '-Dorg.gradle.parallel=false' \
+            '-Dorg.gradle.jvmargs=-Xmx3g -XX:MaxMetaspaceSize=768m -Dfile.encoding=UTF-8' \
+            -PRELEASE_STORE_PASSWORD="$KEYPASS" \
+            -PRELEASE_KEY_PASSWORD="$KEYPASS" \
+            -PRELEASE_KEY_ALIAS=haslgramci \
+            :TMessagesProj_AppStandalone:assembleAfatDebug
+
+      - name: Package APK and checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          apk='TMessagesProj_AppStandalone/build/outputs/apk/afat/debug/app.apk'
+          test -s "$apk"
+          cp "$apk" dist/HaslGram-arm64-debug.apk
+          (cd dist && sha256sum HaslGram-arm64-debug.apk > SHA256SUMS.txt)
+          ls -lh dist/
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: HaslGram-Android-arm64-test-APK
+          path: dist/
+          retention-days: 7
+          if-no-files-found: error
